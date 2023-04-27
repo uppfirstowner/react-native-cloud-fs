@@ -1,19 +1,12 @@
 package org.rncloudfs;
 
 import android.app.Activity;
-import android.app.Dialog;
-import android.app.DialogFragment;
-import android.content.DialogInterface;
 import android.content.Intent;
-import android.content.IntentSender;
+import androidx.annotation.Nullable;
+
 import android.net.Uri;
-import android.os.AsyncTask;
-import android.os.Bundle;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
-
 import com.facebook.react.bridge.ActivityEventListener;
 import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.Promise;
@@ -21,34 +14,54 @@ import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.ReadableMap;
-import com.facebook.react.bridge.ReadableMapKeySetIterator;
+import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.WritableNativeArray;
+import com.facebook.react.bridge.WritableNativeMap;
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
 import com.google.android.gms.common.ConnectionResult;
-import com.google.android.gms.common.GoogleApiAvailability;
+import com.google.android.gms.common.api.ApiException;
 import com.google.android.gms.common.api.GoogleApiClient;
-import com.google.android.gms.drive.Drive;
-import com.google.android.gms.drive.DriveFolder;
+import com.google.android.gms.common.api.Scope;
 
-import java.io.File;
+import com.google.android.gms.auth.api.signin.GoogleSignIn;
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
+import com.google.android.gms.auth.api.signin.GoogleSignInClient;
+import com.google.android.gms.tasks.Task;
+import com.google.android.gms.tasks.Tasks;
+import com.google.api.client.extensions.android.http.AndroidHttp;
+import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential;
+import com.google.api.client.googleapis.extensions.android.gms.auth.UserRecoverableAuthIOException;
+import com.google.api.client.json.gson.GsonFactory;
+import com.google.api.services.drive.Drive;
+import com.google.api.services.drive.DriveScopes;
+import com.google.api.services.drive.model.File;
+
+
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.List;
-
-import static android.app.Activity.RESULT_OK;
-import static org.rncloudfs.GoogleDriveApiClient.resolve;
+import java.util.Collections;
+import java.util.concurrent.ExecutionException;
 
 public class RNCloudFsModule extends ReactContextBaseJavaModule implements GoogleApiClient.OnConnectionFailedListener, LifecycleEventListener, ActivityEventListener {
     public static final String TAG = "RNCloudFs";
+    private static final int REQUEST_CODE_SIGN_IN = 1;
+    private static final int REQUEST_CODE_OPEN_DOCUMENT = 2;
+    private static final int REQUEST_AUTHORIZATION = 11;
+    private DriveServiceHelper mDriveServiceHelper;
 
-    private static final int REQUEST_CODE_RESOLUTION = 3;
-    private static final int REQUEST_RESOLVE_ERROR = 1001;
-    private static final String DIALOG_ERROR = "dialog_error";
-    private boolean isResolvingError = false;
-
+    private Promise signInPromise;
+    private @Nullable Promise mPendingPromise; // we use it for calling again copyToCloud after obtaining authorisation
+    private @Nullable ReadableMap mPendingOptions;
+    private static final String COPY_TO_CLOUD = "CopyToCloud";
+    private static final String LIST_FILES = "ListFiles";
+    private @Nullable String mPendingOperation = null;
     private final ReactApplicationContext reactContext;
     private GoogleApiClient googleApiClient;
 
@@ -60,75 +73,157 @@ public class RNCloudFsModule extends ReactContextBaseJavaModule implements Googl
         reactContext.addActivityEventListener(this);
     }
 
+    @Override
+    public String getName() {
+        return "RNCloudFs";
+    }
+
     /**
      * android only method.  Just here to test the connection logic
      */
     @ReactMethod
     public void reset(final Promise promise) {
-        final GoogleApiClient googleApiClient = this.googleApiClient;
 
-        connect(new GoogleApiClient.ConnectionCallbacks() {
-            @Override
-            public void onConnected(@Nullable Bundle bundle) {
-                googleApiClient.clearDefaultAccountAndReconnect();
-                googleApiClient.unregisterConnectionCallbacks(this);
-                promise.resolve(null);
-            }
-
-            @Override
-            public void onConnectionSuspended(int i) {
-
-            }
-        });
-    }
-
-    @ReactMethod
-    public void createFile(ReadableMap options, final Promise promise) {
-        if (!options.hasKey("targetPath")) {
-            promise.reject("error", "targetPath not specified");
-        }
-        final String path = options.getString("targetPath");
-
-        if (!options.hasKey("content")) {
-            promise.reject("error", "content not specified");
-        }
-        final String content = options.getString("content");
-
-        final boolean useDocumentsFolder = options.hasKey("scope") ? options.getString("scope").toLowerCase().equals("visible") : true;
-
-        connect(new CreateFileTask(path, promise, useDocumentsFolder, content));
     }
 
     @ReactMethod
     public void fileExists(ReadableMap options, final Promise promise) {
-        if (!options.hasKey("targetPath")) {
-            promise.reject("error", "targetPath not specified");
+        if (mDriveServiceHelper != null) {
+            String fileId = options.getString("fileId");
+            Log.d(TAG, "Reading file " + fileId);
+
+            mDriveServiceHelper.checkIfFileExists(fileId)
+                    .addOnSuccessListener(exists -> {
+                        promise.resolve(exists);
+
+                    })
+                    .addOnFailureListener(exception ->{
+                        try{
+                            UserRecoverableAuthIOException e = (UserRecoverableAuthIOException)exception;
+                            this.reactContext.startActivityForResult(e.getIntent(), REQUEST_AUTHORIZATION, null);
+                        } catch(Exception e){
+                            Log.e(TAG, "Couldn't read file.", exception);
+                            promise.reject(exception);
+                        }
+                    });
         }
-        String path = options.getString("targetPath");
+    }
 
-        boolean useDocumentsFolder = !options.hasKey("scope") || options.getString("scope").toLowerCase().equals("visible");
+    @ReactMethod
+    public void deleteFromCloud(ReadableMap options, final Promise promise) {
+        if (mDriveServiceHelper != null) {
+            String fileId = options.getString("id");
+            Log.d(TAG, "Deleting file " + fileId);
 
-        connect(new FileExistsTask(useDocumentsFolder, path, promise));
+            mDriveServiceHelper.deleteFile(fileId)
+                    .addOnSuccessListener(deleted -> {
+                        promise.resolve(deleted);
+
+                    })
+                    .addOnFailureListener(exception ->{
+                        try{
+                            UserRecoverableAuthIOException e = (UserRecoverableAuthIOException)exception;
+                            this.reactContext.startActivityForResult(e.getIntent(), REQUEST_AUTHORIZATION, null);
+                        } catch(Exception e){
+                            Log.e(TAG, "Couldn't delete file.", exception);
+                            promise.reject(exception);
+                        }
+                    });
+        }
+    }
+
+    @ReactMethod
+    public void loginIfNeeded(final Promise promise){
+        if (mDriveServiceHelper == null) {
+            // Check for already logged in account
+            GoogleSignInAccount account = GoogleSignIn.getLastSignedInAccount(this.reactContext);
+
+            // Not signed in - request sign in
+            if (account == null) {
+                this.signInPromise = promise;
+                requestSignIn();
+            } else {
+                // Restore mDriveServiceHelper
+                // Use the authenticated account to sign in to the Drive service.
+                GoogleAccountCredential credential =
+                        GoogleAccountCredential.usingOAuth2(
+                                this.reactContext, Collections.singleton(DriveScopes.DRIVE_APPDATA));
+                credential.setSelectedAccount(account.getAccount());
+                Drive googleDriveService =
+                        new Drive.Builder(
+                                AndroidHttp.newCompatibleTransport(),
+                                new GsonFactory(),
+                                credential)
+                                .build();
+
+                // The DriveServiceHelper encapsulates all REST API and SAF functionality.
+                // Its instantiation is required before handling any onClick actions.
+                mDriveServiceHelper = new DriveServiceHelper(googleDriveService);
+                promise.resolve(true);
+            }
+        }  else {
+            promise.resolve(true);
+        }
     }
 
     @ReactMethod
     public void listFiles(ReadableMap options, final Promise promise) {
-        if (!options.hasKey("targetPath")) {
-            promise.reject("error", "targetPath not specified");
+        if (mDriveServiceHelper != null) {
+            Log.d(TAG, "Querying for files.");
+            WritableArray files = new WritableNativeArray();
+            WritableMap result = new WritableNativeMap();
+
+            boolean useDocumentsFolder = options.hasKey("scope") ? options.getString("scope").toLowerCase().equals("visible") : true;
+            try {
+
+                mDriveServiceHelper.queryFiles(useDocumentsFolder)
+                        .addOnSuccessListener(fileList -> {
+                            for (File file : fileList.getFiles()) {
+                                WritableMap fileInfo = new WritableNativeMap();
+                                fileInfo.putString("name", file.getName());
+                                fileInfo.putString("id", file.getId());
+                                fileInfo.putString("lastModified", file.getModifiedTime().toString());
+                                files.pushMap(fileInfo);
+                            }
+                            result.putArray("files", files);
+                            promise.resolve(result);
+                            clearPendingOperations();
+                        })
+                        .addOnFailureListener(exception -> {
+                            clearPendingOperations();
+                            Log.e(TAG, "Unable to query files: " + exception.getCause().getMessage());
+                            try {
+                                UserRecoverableAuthIOException e = (UserRecoverableAuthIOException) exception;
+                                mPendingPromise = promise;
+                                mPendingOptions = options;
+                                mPendingOperation = LIST_FILES;
+                                this.reactContext.startActivityForResult(e.getIntent(), REQUEST_AUTHORIZATION, null);
+                            } catch (Exception e) {
+                                throw e;
+                            }
+                        });
+            } catch (Exception exception) {
+                try {
+                    ExecutionException e = (ExecutionException) exception;
+                    mPendingPromise = promise;
+                    mPendingOptions = options;
+                    mPendingOperation = LIST_FILES;
+                    Intent intent = ((UserRecoverableAuthIOException) e.getCause()).getIntent();
+                    this.reactContext.startActivityForResult(intent, REQUEST_AUTHORIZATION, null);
+                } catch (Exception e) {
+                    promise.reject(exception);
+                    Log.e(TAG, "Unable to query files: " + exception.getCause().getMessage());
+                }
+            }
         }
-        String path = options.getString("targetPath");
-
-        boolean useDocumentsFolder = !options.hasKey("scope") || options.getString("scope").toLowerCase().equals("visible");
-
-        connect(new ListFilesTask(useDocumentsFolder, path, promise));
     }
 
     /**
      * Copy the source into the google drive database
      */
     @ReactMethod
-    public void copyToCloud(ReadableMap options, final Promise promise) {
-        try {
+    public void copyToCloud(ReadableMap options, final Promise promise) throws ExecutionException, InterruptedException {
+        if(mDriveServiceHelper != null){
             if (!options.hasKey("sourcePath")) {
                 promise.reject("error", "sourcePath not specified");
             }
@@ -156,8 +251,6 @@ public class RNCloudFsModule extends ReactContextBaseJavaModule implements Googl
 
             boolean useDocumentsFolder = options.hasKey("scope") ? options.getString("scope").toLowerCase().equals("visible") : true;
 
-            SourceUri sourceUri = new SourceUri(uriOrPath, source.hasKey("headers") ? source.getMap("headers") : null);
-
             String actualMimeType;
             if (mimeType == null) {
                 actualMimeType = guessMimeType(uriOrPath);
@@ -165,18 +258,36 @@ public class RNCloudFsModule extends ReactContextBaseJavaModule implements Googl
                 actualMimeType = null;
             }
 
-            connect(new CopyToGoogleDriveTask(
-                    sourceUri,
-                    destinationPath,
-                    actualMimeType,
-                    promise,
-                    new GoogleDriveApiClient(this.googleApiClient, reactContext),
-                    useDocumentsFolder)
-            );
-
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to copy", e);
-            promise.reject("Failed to copy", e);
+            try {
+                mDriveServiceHelper.saveFile(uriOrPath, destinationPath, actualMimeType, useDocumentsFolder)
+                        .addOnSuccessListener(fileId -> {
+                            Log.d(TAG, "Saving " + fileId);
+                            promise.resolve(fileId);
+                            clearPendingOperations();
+                        }).addOnFailureListener(exception -> {
+                            clearPendingOperations();
+                            try {
+                                UserRecoverableAuthIOException e = (UserRecoverableAuthIOException) exception;
+                                this.reactContext.startActivityForResult(e.getIntent(), REQUEST_AUTHORIZATION, null);
+                            } catch (Exception e) {
+                                Log.e(TAG, "Couldn't create file.", exception);
+                            } finally {
+                                promise.reject(exception);
+                            }
+                        });
+            } catch (Exception exception) {
+                try {
+                    ExecutionException e = (ExecutionException) exception;
+                    mPendingPromise = promise;
+                    mPendingOptions = options;
+                    mPendingOperation = COPY_TO_CLOUD;
+                    Intent intent = ((UserRecoverableAuthIOException) e.getCause()).getIntent();
+                    this.reactContext.startActivityForResult(intent, REQUEST_AUTHORIZATION, null);
+                } catch (Exception e) {
+                    promise.reject(exception);
+                    Log.e(TAG, "Couldn't create file.", exception);
+                }
+            }
         }
     }
 
@@ -192,20 +303,17 @@ public class RNCloudFsModule extends ReactContextBaseJavaModule implements Googl
 
     @Override
     public void onHostResume() {
-        if (this.googleApiClient != null)
-            googleApiClient.connect();
+
     }
 
     @Override
     public void onHostPause() {
-        if (this.googleApiClient != null)
-            this.googleApiClient.disconnect();
+
     }
 
     @Override
     public void onHostDestroy() {
-        if (this.googleApiClient != null)
-            this.googleApiClient.disconnect();
+
     }
 
     @Override
@@ -213,296 +321,188 @@ public class RNCloudFsModule extends ReactContextBaseJavaModule implements Googl
         System.out.println("RNCloudFsModule.onNewIntent");
     }
 
+    public void clearPendingOperations(){
+        mPendingOperation = null;
+        mPendingPromise = null;
+        mPendingOptions = null;
+    }
+
     @Override
     public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
-        if (requestCode == REQUEST_CODE_RESOLUTION && resultCode == RESULT_OK)
-            this.googleApiClient.connect();
-        else if (requestCode == REQUEST_RESOLVE_ERROR) {
-            isResolvingError = false;
-
-            if (resultCode == RESULT_OK) {
-                // Make sure the app is not already connected or attempting to connect
-                if (!googleApiClient.isConnecting() && !googleApiClient.isConnected()) {
-                    googleApiClient.connect();
+        switch (requestCode) {
+            case REQUEST_CODE_SIGN_IN:
+                // The Task returned from this call is always completed, no need to attach
+                // a listener.
+                Task<GoogleSignInAccount> task = GoogleSignIn.getSignedInAccountFromIntent(data);
+                handleSignInResult(task);
+                break;
+            case REQUEST_AUTHORIZATION:
+                if (resultCode == Activity.RESULT_OK && data != null) {
+                    // we want to make the operation again after obtaining right permissions
+                    if (mPendingOperation != null) {
+                        final String copiedPendingOperation = mPendingOperation;
+                        reactContext.runOnNativeModulesQueueThread(() -> {
+                            mPendingOperation = null;
+                            switch (copiedPendingOperation) {
+                                case COPY_TO_CLOUD:
+                                    try {
+                                        copyToCloud(mPendingOptions, mPendingPromise);
+                                    } catch (ExecutionException | InterruptedException ignore) {
+                                        mPendingPromise.reject(ignore);
+                                        clearPendingOperations();
+                                    }
+                                    break;
+                                case LIST_FILES:
+                                    try {
+                                        listFiles(mPendingOptions, mPendingPromise);
+                                    } catch (Exception e) {
+                                        mPendingPromise.reject(e);
+                                        clearPendingOperations();
+                                    }
+                                    break;
+                            }
+                        });
+                    }
+                } else if (resultCode == Activity.RESULT_CANCELED && mPendingPromise != null) {
+                    mPendingPromise.reject("canceled", "User canceled");
+                } else if (mPendingPromise != null) {
+                    mPendingPromise.reject("unknown error", "Operation failed: " + mPendingOperation + " result code " + resultCode);
                 }
-            }
+                break;
         }
+
     }
 
     @Override
     public void onConnectionFailed(ConnectionResult result) {
-        if (isResolvingError) {
-            // Already attempting to resolve an error.
-        } else if (result.hasResolution()) {
-            try {
-                isResolvingError = true;
-                result.startResolutionForResult(getCurrentActivity(), REQUEST_RESOLVE_ERROR);
-            } catch (IntentSender.SendIntentException e) {
-                // There was an error with the resolution intent. Try again.
-                googleApiClient.connect();
-            }
-        } else {
-            showErrorDialog(result.getErrorCode());
-            isResolvingError = true;
-        }
+
     }
 
-    private void showErrorDialog(int errorCode) {
-        ErrorDialogFragment dialogFragment = new ErrorDialogFragment();
-        Bundle args = new Bundle();
-        args.putInt(DIALOG_ERROR, errorCode);
+    /**
+     * Copy the source into the google drive database
+     */
 
-        dialogFragment.setArguments(args);
-        dialogFragment.show(getCurrentActivity().getFragmentManager(), "errordialog");
-    }
+    /**
+     * Starts a sign-in activity using {@link #REQUEST_CODE_SIGN_IN}.
+     */
+    @ReactMethod
+    public void requestSignIn() {
+        Log.d(TAG, "Requesting sign-in");
 
-    /* Called from ErrorDialogFragment when the dialog is dismissed. */
-    public void onDialogDismissed() {
-        isResolvingError = false;
-    }
-
-    /* A fragment to display an error dialog */
-    public static class ErrorDialogFragment extends DialogFragment {
-        public ErrorDialogFragment() {
-        }
-
-        @Override
-        public Dialog onCreateDialog(Bundle savedInstanceState) {
-            int errorCode = this.getArguments().getInt(DIALOG_ERROR);
-            return GoogleApiAvailability.getInstance().getErrorDialog(this.getActivity(), errorCode, REQUEST_RESOLVE_ERROR);
-        }
-
-        @Override
-        public void onDismiss(DialogInterface dialog) {
-            Activity activity = getActivity();
-
-            //todo - call back to onDialogDismissed
-        }
-    }
-
-    public interface InputDataSource {
-        void copyToOutputStream(OutputStream output) throws IOException;
-    }
-
-    public class SourceUri implements InputDataSource {
-        public final String uri;
-        @Nullable
-        private final ReadableMap httpHeaders;
-
-        private SourceUri(String uri, @Nullable ReadableMap httpHeaders) {
-            this.uri = uri;
-            this.httpHeaders = httpHeaders;
-        }
-
-        private InputStream read() throws IOException {
-            if (uri.startsWith("/") || uri.startsWith("file:/")) {
-                String path = uri.replaceFirst("^file\\:/+", "/");
-                File file = new File(path);
-                return new FileInputStream(file);
-            } else if (uri.startsWith("content://")) {
-                return RNCloudFsModule.this.reactContext.getContentResolver().openInputStream(Uri.parse(uri));
-            } else {
-                HttpURLConnection conn = (HttpURLConnection) new URL(uri).openConnection();
-
-                if (httpHeaders != null) {
-                    ReadableMapKeySetIterator readableMapKeySetIterator = httpHeaders.keySetIterator();
-                    while (readableMapKeySetIterator.hasNextKey()) {
-                        String key = readableMapKeySetIterator.nextKey();
-                        if (key == null)
-                            continue;
-                        String value = httpHeaders.getString(key);
-                        if (value == null)
-                            continue;
-                        conn.setRequestProperty(key, value);
-                    }
-                }
-
-                conn.setRequestMethod("GET");
-
-                return conn.getInputStream();
-            }
-        }
-
-        public void copyToOutputStream(OutputStream output) throws IOException {
-            InputStream input = read();
-            if (input == null)
-                throw new IllegalStateException("Cannot read " + uri);
-
-            try {
-                byte[] buffer = new byte[256];
-                int bytesRead;
-                while ((bytesRead = input.read(buffer)) != -1) {
-                    output.write(buffer, 0, bytesRead);
-                }
-            } finally {
-                input.close();
-            }
-        }
-    }
-
-    @NonNull
-    private void connect(GoogleApiClient.ConnectionCallbacks listener) {
-        if (googleApiClient == null) {
-            synchronized (this) {
-                googleApiClient = new GoogleApiClient.Builder(reactContext)
-                        .addApi(Drive.API)
-                        .addScope(Drive.SCOPE_FILE)
-                        .addScope(Drive.SCOPE_APPFOLDER)
-                        .addConnectionCallbacks(new GoogleApiClient.ConnectionCallbacks() {
-                            @Override
-                            public void onConnected(@Nullable Bundle bundle) {
-                                Log.i(TAG, "Google client API connected");
-                            }
-
-                            @Override
-                            public void onConnectionSuspended(int i) {
-                                //what to do here??
-                                Log.w(TAG, "Google client API suspended: " + i);
-                            }
-                        })
-                        .addOnConnectionFailedListener(this)
+        GoogleSignInOptions signInOptions =
+                new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                        .requestEmail()
+                        .requestScopes(new Scope(DriveScopes.DRIVE_FILE))
                         .build();
+        GoogleSignInClient client = GoogleSignIn.getClient(this.reactContext, signInOptions);
+
+        // The result of the sign-in Intent is handled in onActivityResult.
+        this.reactContext.startActivityForResult(client.getSignInIntent(), REQUEST_CODE_SIGN_IN, null);
+    }
+
+    @ReactMethod
+    public void getCurrentlySignedInUserData(Promise promise) {
+        Log.d(TAG, "Logging out");
+
+        GoogleSignInAccount account = GoogleSignIn.getLastSignedInAccount(this.reactContext);
+        if (account == null) {
+            promise.resolve(null);
+        } else {
+            Uri photoUrl = account.getPhotoUrl();
+            WritableMap resultData = new WritableNativeMap();
+            resultData.putString("email", account.getEmail());
+            resultData.putString("name", account.getDisplayName());
+            resultData.putString("avatarUrl", photoUrl != null ? photoUrl.toString() : null);
+            promise.resolve(resultData);
+        }
+    }
+
+    @ReactMethod
+    public void logout(Promise promise) {
+
+        Log.d(TAG, "Requesting sign-in");
+
+        GoogleSignInOptions signInOptions =
+                new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                        .requestEmail()
+                        .requestScopes(new Scope(DriveScopes.DRIVE_FILE))
+                        .build();
+        GoogleSignInClient client = GoogleSignIn.getClient(this.reactContext, signInOptions);
+        mDriveServiceHelper = null;
+        client.signOut()
+                .addOnSuccessListener( result -> {
+                    promise.resolve(true);
+                })
+                .addOnFailureListener(exception ->{
+                    Log.e(TAG, "Couldn't log out.", exception);
+                    promise.reject(exception);
+                });
+    }
+
+    /**
+     * Handles the {@code result} of a completed sign-in activity initiated from {@link
+     * #requestSignIn()} ()}.
+     */
+    private void handleSignInResult(Task<GoogleSignInAccount> completedTask) {
+        try {
+            GoogleSignInAccount googleAccount = completedTask.getResult(ApiException.class);
+            Log.d(TAG, "Signed in as " + googleAccount.getEmail());
+
+            // Use the authenticated account to sign in to the Drive service.
+            GoogleAccountCredential credential =
+                    GoogleAccountCredential.usingOAuth2(
+                            this.reactContext, Collections.singleton(DriveScopes.DRIVE_APPDATA));
+            credential.setSelectedAccount(googleAccount.getAccount());
+            Drive googleDriveService =
+                    new Drive.Builder(
+                            AndroidHttp.newCompatibleTransport(),
+                            new GsonFactory(),
+                            credential)
+                            .build();
+
+            // The DriveServiceHelper encapsulates all REST API and SAF functionality.
+            // Its instantiation is required before handling any onClick actions.
+            mDriveServiceHelper = new DriveServiceHelper(googleDriveService);
+
+            if(this.signInPromise != null){
+                this.signInPromise.resolve(true);
+                this.signInPromise = null;
+            }
+        } catch (ApiException e) {
+            // The ApiException status code indicates the detailed failure reason.
+            // Please refer to the GoogleSignInStatusCodes class reference for more information.
+            Log.w(TAG, "signInResult:failed code=" + e.getStatusCode());
+            if(this.signInPromise != null){
+                this.signInPromise.reject("signInResult:" + e.getStatusCode(), e.getMessage());
+                this.signInPromise = null;
             }
         }
-
-        this.googleApiClient.registerConnectionCallbacks(listener);
-        this.googleApiClient.connect();
     }
 
-    @Override
-    public String getName() {
-        return "RNCloudFs";
-    }
+    /**
+     * Retrieves the title and content of a file identified by {@code fileId} and populates the UI.
+     */
+    @ReactMethod
+    public void getGoogleDriveDocument(String fileId, Promise promise) {
+        if (mDriveServiceHelper != null) {
+            Log.d(TAG, "Reading file " + fileId);
 
-    private class ListFilesTask implements GoogleApiClient.ConnectionCallbacks {
-        private final boolean useDocumentsFolder;
-        private final String path;
-        private final Promise promise;
+            mDriveServiceHelper.readFile(fileId)
+                    .addOnSuccessListener(content -> {
+                        promise.resolve(content);
 
-        public ListFilesTask(boolean useDocumentsFolder, String path, Promise promise) {
-            this.useDocumentsFolder = useDocumentsFolder;
-            this.path = path;
-            this.promise = promise;
-        }
-
-        @Override
-        public void onConnected(@Nullable Bundle bundle) {
-            final GoogleDriveApiClient googleDriveApiClient = new GoogleDriveApiClient(RNCloudFsModule.this.googleApiClient, reactContext);
-
-            AsyncTask.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        WritableMap data = googleDriveApiClient.listFiles(useDocumentsFolder, resolve(path));
-                        promise.resolve(data);
-                    } catch (Exception e) {
-                        promise.reject("error", e);
-                    }
-                }
-            });
-
-            googleDriveApiClient.unregisterListener(this);
-        }
-
-        @Override
-        public void onConnectionSuspended(int i) {
-            Log.w(TAG, "Google client API suspended: " + i);
-        }
-    }
-
-    private class CreateFileTask implements GoogleApiClient.ConnectionCallbacks {
-        private final String path;
-        private final Promise promise;
-        private final boolean useDocumentsFolder;
-        private final String content;
-
-        public CreateFileTask(String path, Promise promise, boolean useDocumentsFolder, String content) {
-            this.path = path;
-            this.promise = promise;
-            this.useDocumentsFolder = useDocumentsFolder;
-            this.content = content;
-        }
-
-        @Override
-        public void onConnected(@Nullable Bundle bundle) {
-            final GoogleDriveApiClient googleDriveApiClient = new GoogleDriveApiClient(RNCloudFsModule.this.googleApiClient, reactContext);
-
-            AsyncTask.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-
-                        List<String> pathParts = resolve(path);
-                        if (pathParts.size() == 0) {
-                            promise.reject("error", "no filename specified");
-                            return;
+                    })
+                    .addOnFailureListener(exception ->{
+                        try{
+                            UserRecoverableAuthIOException e = (UserRecoverableAuthIOException)exception;
+                            this.reactContext.startActivityForResult(e.getIntent(), REQUEST_AUTHORIZATION, null);
+                        } catch(Exception e){
+                            Log.e(TAG, "Couldn't read file.", exception);
+                            promise.reject(exception);
                         }
-
-                        DriveFolder parentFolder = useDocumentsFolder ? googleDriveApiClient.documentsFolder() : googleDriveApiClient.appFolder();
-                        if (pathParts.size() > 1) {
-                            List<String> parentDirs = pathParts.subList(0, pathParts.size() - 1);
-                            parentFolder = googleDriveApiClient.createFolders(parentFolder, parentDirs);
-                        }
-
-                        String filename = pathParts.get(pathParts.size() - 1);
-
-                        String outputFilename = googleDriveApiClient.createFile(parentFolder, new InputDataSource() {
-                            @Override
-                            public void copyToOutputStream(OutputStream output) throws IOException {
-                                output.write(content.getBytes("UTF-8"));
-                            }
-                        }, filename);
-
-                        promise.resolve(outputFilename);
-                    } catch (Exception e) {
-                        promise.reject("error", e);
-                    }
-
-                }
-            });
-
-            googleDriveApiClient.unregisterListener(this);
-        }
-
-        @Override
-        public void onConnectionSuspended(int i) {
-            Log.w(TAG, "Google client API suspended: " + i);
+                    });
         }
     }
 
-    private class FileExistsTask implements GoogleApiClient.ConnectionCallbacks {
-        private final boolean useDocumentsFolder;
-        private final String path;
-        private final Promise promise;
 
-        public FileExistsTask(boolean useDocumentsFolder, String path, Promise promise) {
-            this.useDocumentsFolder = useDocumentsFolder;
-            this.path = path;
-            this.promise = promise;
-        }
-
-        @Override
-        public void onConnected(@Nullable Bundle bundle) {
-            final GoogleDriveApiClient googleDriveApiClient = new GoogleDriveApiClient(RNCloudFsModule.this.googleApiClient, reactContext);
-
-            AsyncTask.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        boolean fileExists = googleDriveApiClient.fileExists(useDocumentsFolder, resolve(path));
-                        promise.resolve(fileExists);
-                    } catch (Exception e) {
-                        promise.reject("error", e);
-                    }
-                }
-            });
-
-            googleDriveApiClient.unregisterListener(this);
-        }
-
-        @Override
-        public void onConnectionSuspended(int i) {
-            Log.w(TAG, "Google client API suspended: " + i);
-        }
-    }
 }
