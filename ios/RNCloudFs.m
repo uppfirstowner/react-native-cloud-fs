@@ -30,6 +30,7 @@ RCT_EXPORT_METHOD(createFile:(NSDictionary *) options
     NSString *content = [options objectForKey:@"content"];
     NSString *scope = [options objectForKey:@"scope"];
     bool documentsFolder = !scope || [scope caseInsensitiveCompare:@"visible"] == NSOrderedSame;
+    BOOL update = [[options objectForKey:@"update"] boolValue];
 
     NSString *tempFile = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
 
@@ -39,7 +40,7 @@ RCT_EXPORT_METHOD(createFile:(NSDictionary *) options
         return reject(@"error", error.description, nil);
     }
 
-    [self moveToICloudDirectory:documentsFolder :tempFile :destinationPath :false :resolve :reject];
+    [self moveToICloudDirectory:documentsFolder :tempFile :destinationPath :update :resolve :reject];
 }
 
 RCT_EXPORT_METHOD(fileExists:(NSDictionary *)options
@@ -49,6 +50,7 @@ RCT_EXPORT_METHOD(fileExists:(NSDictionary *)options
     NSString *destinationPath = [options objectForKey:@"targetPath"];
     NSString *scope = [options objectForKey:@"scope"];
     bool documentsFolder = !scope || [scope caseInsensitiveCompare:@"visible"] == NSOrderedSame;
+    
 
     NSFileManager* fileManager = [NSFileManager defaultManager];
 
